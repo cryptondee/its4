@@ -92,7 +92,7 @@ class ProxyManager {
     }
 
 async _sendTransactionThroughProxy(proxy, task) {
-    this.log(`Proxy ${proxy.id}: Processing task for wallet ${task.privateKey.substring(0,10)}... (Method/Data: ${task.methodName ? task.methodName.substring(0,40) : 'N/A'}...)`);
+    // this.log(`Proxy ${proxy.id}: Processing task for wallet ${task.privateKey.substring(0,10)}... (Method/Data: ${task.methodName ? task.methodName.substring(0,40) : 'N/A'}...)`);
     const agent = proxy.agent; // Use agent from proxy object
 
     // customFetch for ethers.JsonRpcProvider to use HttpsProxyAgent
@@ -131,7 +131,7 @@ async _sendTransactionThroughProxy(proxy, task) {
         let transactionRequest = {};
 
         if (task.methodName && typeof task.methodName === 'string' && task.methodName.startsWith('0x') && (!task.methodArgs || task.methodArgs.length === 0)) {
-            this.log(`Proxy ${proxy.id}: Wallet ${proxiedSigner.address} - Preparing raw transaction with data: ${task.methodName}`);
+            // this.log(`Proxy ${proxy.id}: Wallet ${proxiedSigner.address} - Preparing raw transaction with data: ${task.methodName}`);
 
             transactionRequest = {
                 to: this.contractAddress,
@@ -140,7 +140,7 @@ async _sendTransactionThroughProxy(proxy, task) {
                 ...(task.txOptions || {})
             };
         } else if (this.contractAbi && this.contractAbi.length > 0 && task.methodName) {
-            this.log(`Proxy ${proxy.id}: Wallet ${proxiedSigner.address} - Populating transaction for method '${task.methodName}'`);
+            // this.log(`Proxy ${proxy.id}: Wallet ${proxiedSigner.address} - Populating transaction for method '${task.methodName}'`);
             const contract = new ethers.Contract(this.contractAddress, this.contractAbi, proxiedSigner);
             const rawTxObject = {
                 nonce: task.nonce,
@@ -238,7 +238,7 @@ async _sendTransactionThroughProxy(proxy, task) {
             const taskData = { privateKey, methodName, methodArgs, txOptions, resolve, reject, nonce };
     
             selectedProxy.requestQueue.push(taskData);
-            console.log(`[${selectedProxy.id}] Task queued for wallet ${privateKey.substring(0,10)}... Method: ${methodName}. Queue size: ${selectedProxy.requestQueue.length}`);
+            // console.log(`[${selectedProxy.id}] Task queued for wallet ${privateKey.substring(0,10)}... Method: ${methodName}. Queue size: ${selectedProxy.requestQueue.length}`);
 
             if (!selectedProxy.isProcessing) {
                 this._processQueue(selectedProxy);

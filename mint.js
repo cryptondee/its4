@@ -77,7 +77,7 @@ if (!OXYLABS_CORE_USERNAME || !OXYLABS_PASSWORD) {
     process.exit(1);
 }
 
-const NUM_PROXY_SESSIONS = 120; // The number of concurrent proxy sessions you want
+const NUM_PROXY_SESSIONS = 150; // The number of concurrent proxy sessions you want
 const PROXY_CONFIGS = [];
 
 for (let i = 0; i < NUM_PROXY_SESSIONS; i++) {
@@ -248,7 +248,7 @@ async function main() {
     }
 
     // Initialize ProxyManager
-    const proxyManager = new ProxyManager(PROXY_CONFIGS, RPC_URL, CONTRACT_ADDRESS, CONTRACT_ABI, CONFIRMATIONS_REQUIRED);
+    const proxyManager = new ProxyManager(PROXY_CONFIGS, RPC_URL, CONTRACT_ADDRESS, CONTRACT_ABI, CONFIRMATIONS_REQUIRED, NUM_PROXY_SESSIONS);
 
     // Step 1: Fetch initial nonces for all wallets
     console.log("Fetching initial nonces for all wallets...");
@@ -271,7 +271,7 @@ async function main() {
 
     console.log(`Starting a total of ${TOTAL_TRANSACTIONS_TO_SEND} transactions using ${activeWallets.length} active wallets. Raw data: ${RAW_TRANSACTION_DATA}`);
 
-    const MAX_CONCURRENT_TASKS = 50; // Max number of concurrent transaction processing flows
+    const MAX_CONCURRENT_TASKS = 150; // Max number of concurrent transaction processing flows
     const runningTasks = []; // Stores promises of currently running transaction flows
     let successfulTransactions = 0;
     let failedTransactions = 0;
@@ -279,120 +279,131 @@ async function main() {
 
     console.log(`Starting transaction loop with MAX_CONCURRENT_TASKS: ${MAX_CONCURRENT_TASKS}`);
 
-    for (let i = 0; i < TOTAL_TRANSACTIONS_TO_SEND; i++) {
-        if (runningTasks.length >= MAX_CONCURRENT_TASKS) {
-            // console.log(`Concurrency limit ${MAX_CONCURRENT_TASKS} reached. Waiting for a task to complete... (${runningTasks.length} active)`);
-            try {
-                await Promise.race(runningTasks);
-            } catch (e) {
-                // A promise in Promise.race might have rejected, this is fine, it means a slot is free.
-                // console.log("A task completed (possibly with error), freeing up concurrency slot.");
-            }
+    const numActiveWallets = activeWallets.length;
+    const transactionsPerWalletBase = Math.floor(TOTAL_TRANSACTIONS_TO_SEND / numActiveWallets);
+    let remainderTransactions = TOTAL_TRANSACTIONS_TO_SEND % numActiveWallets;
+    let overallDispatchedCount = 0;
+
+    for (const walletInfo of activeWallets) {
+        let transactionsForThisWallet = transactionsPerWalletBase;
+        if (remainderTransactions > 0) {
+            transactionsForThisWallet++;
+            remainderTransactions--;
         }
 
-        const walletIndex = i % activeWallets.length;
-        const walletInfo = activeWallets[walletIndex];
-        const transactionNumber = ++globalTransactionCounter; // Use a global counter for unique tx logging ID
+        if (transactionsForThisWallet === 0) continue;
 
-        const taskPromise = withWalletLock(walletInfo.address, async () => {
-            // This async block is serialized per wallet due to withWalletLock
-            // It represents the processing for a single transaction for this wallet
-            for (let attempt = 0; attempt < MAX_TRANSACTION_RETRIES; attempt++) {
+        console.log(`Wallet ${walletInfo.address.substring(0,10)}... assigned ${transactionsForThisWallet} transactions.`);
+
+        for (let j = 0; j < transactionsForThisWallet; j++) {
+            if (overallDispatchedCount >= TOTAL_TRANSACTIONS_TO_SEND) break; // Safety break
+
+            if (runningTasks.length >= MAX_CONCURRENT_TASKS) {
+                // console.log(`Concurrency limit ${MAX_CONCURRENT_TASKS} reached. Waiting for a task to complete... (${runningTasks.length} active)`);
                 try {
-                    console.log(`Tx #${transactionNumber} (Wallet ${walletInfo.address.substring(0,10)}..., Nonce ${walletInfo.currentNonce}, Attempt ${attempt + 1}/${MAX_TRANSACTION_RETRIES}): Preparing...`);
-                    
-                    const rawData = RAW_TRANSACTION_DATA;
-                    const methodArgs = [];
-                    console.log(`Tx #${transactionNumber}: Using RAW_TRANSACTION_DATA starting with: ${rawData.substring(0, 70)}`);
-                    const txOptions = {
-                        gasLimit: 5000000,
-                        gasPrice: ethers.parseUnits("0.0019", "gwei"),
-                    };
+                    await Promise.race(runningTasks);
+                } catch (e) {
+                    // A promise in Promise.race might have rejected, this is fine, it means a slot is free.
+                    // console.log("A task completed (possibly with error), freeing up concurrency slot.");
+                }
+            }
 
-                    const txResult = await proxyManager.submitTransaction(walletInfo.privateKey, walletInfo.currentNonce, rawData, methodArgs, txOptions);
-                    
-                    console.log(`Tx #${transactionNumber} (Wallet ${walletInfo.address.substring(0,10)}..., Nonce ${walletInfo.currentNonce}): Successfully sent. Result: ${txResult ? JSON.stringify(txResult).substring(0,80) : 'No result'}`);
-                    walletInfo.currentNonce++; // IMPORTANT: Increment nonce for this wallet
-                    successfulTransactions++;
-                    // successfulTransactions++; // Moved to the handler of taskPromise
-                    return { success: true, result: txResult, walletAddress: walletInfo.address, transactionNumber };
-                } catch (err) {
-                    console.error(`Tx #${transactionNumber} (Wallet ${walletInfo.address.substring(0,10)}..., Nonce ${walletInfo.currentNonce}, Attempt ${attempt + 1}): Failed: ${err.message}`);
-                    
-                    const errorMessage = err.message.toLowerCase();
-                    const errorReason = err.reason ? err.reason.toLowerCase() : '';
-                    const errorCode = err.code ? err.code.toString().toLowerCase() : '';
+            const transactionNumber = ++globalTransactionCounter; // Use a global counter for unique tx logging ID
 
-                    if (errorMessage.includes('nonce too low') || errorMessage.includes('nonce has already been used') || errorMessage.includes('replacement transaction underpriced') || errorReason.includes('nonce') || errorCode === 'nonce_expired' || errorCode === '-32003' /* Ganache nonce too low */) {
-                        console.log(`Nonce error for Wallet ${walletInfo.address.substring(0,10)}. Attempting to fetch new nonce...`);
-                        let nonceRefetched = false;
-                        for (let nonceAttempt = 0; nonceAttempt < MAX_TRANSACTION_RETRIES; nonceAttempt++) {
-                            await delay(NONCE_RETRY_DELAY_MS * (nonceAttempt + 1)); // Increasing delay for nonce re-fetch
-                            try {
-                                // Use the new queue system for fetching nonces
-                                const attemptInfo = `Attempt ${nonceAttempt + 1}/${MAX_TRANSACTION_RETRIES}`;
-                                const newNonce = await fetchNonceViaQueue(walletInfo.address, attemptInfo);
-                                // Original log for context, newNonce is already logged by queue processor
-                                console.log(`Wallet ${walletInfo.address.substring(0,10)} (Nonce Fetch Attempt ${nonceAttempt + 1}): Old nonce ${walletInfo.currentNonce}, New nonce from provider (via queue): ${newNonce}. Adjusting.`);
-                                walletInfo.currentNonce = newNonce;
-                                nonceRefetched = true;
-                                break; // Successfully fetched new nonce
-                            } catch (nonceFetchErr) {
-                                // Error is already logged by the queue processor
-                                // console.error(`Wallet ${walletInfo.address.substring(0,10)} (Nonce Fetch Attempt ${nonceAttempt + 1}): FAILED to re-fetch nonce via queue: ${nonceFetchErr.message}`);
-                                if (nonceAttempt >= MAX_TRANSACTION_RETRIES - 1) {
-                                    console.error(`Wallet ${walletInfo.address.substring(0,10)}: All ${MAX_TRANSACTION_RETRIES} attempts to re-fetch nonce via queue FAILED.`);
+            const taskPromise = withWalletLock(walletInfo.address, async () => {
+                // This async block is serialized per wallet due to withWalletLock
+                // It represents the processing for a single transaction for this wallet
+                for (let attempt = 0; attempt < MAX_TRANSACTION_RETRIES; attempt++) {
+                    try {
+                        console.log(`Tx #${transactionNumber} (Wallet ${walletInfo.address.substring(0,10)}..., Nonce ${walletInfo.currentNonce}, Attempt ${attempt + 1}/${MAX_TRANSACTION_RETRIES}): Preparing...`);
+                        
+                        const rawData = RAW_TRANSACTION_DATA;
+                        const methodArgs = [];
+                        // console.log(`Tx #${transactionNumber}: Using RAW_TRANSACTION_DATA starting with: ${rawData.substring(0, 70)}`); // Reduced verbosity
+                        const txOptions = {
+                            gasLimit: 5000000,
+                            gasPrice: ethers.parseUnits("0.0019", "gwei"),
+                        };
+
+                        const txResult = await proxyManager.submitTransaction(walletInfo.privateKey, walletInfo.currentNonce, rawData, methodArgs, txOptions);
+                        
+                        console.log(`Tx #${transactionNumber} (Wallet ${walletInfo.address.substring(0,10)}..., Nonce ${walletInfo.currentNonce}): Successfully sent. Hash: ${txResult.hash ? txResult.hash.substring(0,10) : 'N/A'}...`);
+                        walletInfo.currentNonce++; // IMPORTANT: Increment nonce for this wallet
+                        // successfulTransactions++; // Moved to .then() handler below
+                        return { success: true, result: txResult, walletAddress: walletInfo.address, transactionNumber };
+                    } catch (err) {
+                        console.error(`Tx #${transactionNumber} (Wallet ${walletInfo.address.substring(0,10)}..., Nonce ${walletInfo.currentNonce}, Attempt ${attempt + 1}): Failed: ${err.message}`);
+                        
+                        const errorMessage = err.message.toLowerCase();
+                        const errorReason = err.reason ? err.reason.toLowerCase() : '';
+                        const errorCode = err.code ? err.code.toString().toLowerCase() : '';
+
+                        if (errorMessage.includes('nonce too low') || errorMessage.includes('nonce has already been used') || errorMessage.includes('replacement transaction underpriced') || errorReason.includes('nonce') || errorCode === 'nonce_expired' || errorCode === '-32003' /* Ganache nonce too low */) {
+                            console.log(`Nonce error for Wallet ${walletInfo.address.substring(0,10)}. Attempting to fetch new nonce...`);
+                            let nonceRefetched = false;
+                            for (let nonceAttempt = 0; nonceAttempt < MAX_TRANSACTION_RETRIES; nonceAttempt++) {
+                                await delay(NONCE_RETRY_DELAY_MS * (nonceAttempt + 1)); // Increasing delay for nonce re-fetch
+                                try {
+                                    const attemptInfo = `Attempt ${nonceAttempt + 1}/${MAX_TRANSACTION_RETRIES}`;
+                                    const newNonce = await fetchNonceViaQueue(walletInfo.address, attemptInfo);
+                                    console.log(`Wallet ${walletInfo.address.substring(0,10)} (Nonce Fetch Attempt ${nonceAttempt + 1}): Old nonce ${walletInfo.currentNonce}, New nonce from provider (via queue): ${newNonce}. Adjusting.`);
+                                    walletInfo.currentNonce = newNonce;
+                                    nonceRefetched = true;
+                                    break; // Successfully fetched new nonce
+                                } catch (nonceFetchErr) {
+                                    if (nonceAttempt >= MAX_TRANSACTION_RETRIES - 1) {
+                                        console.error(`Wallet ${walletInfo.address.substring(0,10)}: All ${MAX_TRANSACTION_RETRIES} attempts to re-fetch nonce via queue FAILED.`);
+                                    }
                                 }
                             }
+                            if (nonceRefetched && attempt < MAX_TRANSACTION_RETRIES - 1) {
+                                console.log(`Wallet ${walletInfo.address.substring(0,10)}: Nonce updated to ${walletInfo.currentNonce}. Retrying transaction submission.`);
+                                continue; // Retry transaction submission with the new nonce
+                            }
+                        } else if (errorMessage.includes('txpool is full') || errorMessage.includes('exceeds block gas limit') || errorMessage.includes('insufficient funds') || errorMessage.includes('fee too low') || errorMessage.includes('transaction underpriced')) {
+                            console.log(`Retryable error for Wallet ${walletInfo.address.substring(0,10)}: ${err.message}. Waiting ${RETRY_DELAY_MS}ms...`);
+                            await delay(RETRY_DELAY_MS);
+                            if (attempt < MAX_TRANSACTION_RETRIES - 1) continue;
                         }
-                        if (nonceRefetched && attempt < MAX_TRANSACTION_RETRIES - 1) {
-                            console.log(`Wallet ${walletInfo.address.substring(0,10)}: Nonce updated to ${walletInfo.currentNonce}. Retrying transaction submission.`);
-                            continue; // Retry transaction submission with the new nonce
+                        if (attempt >= MAX_TRANSACTION_RETRIES - 1) {
+                            const finalErrorMsg = `Tx #${transactionNumber} (Wallet ${walletInfo.address.substring(0,10)}...): All retries failed. Last error: ${err.message}`;
+                            console.error(finalErrorMsg);
+                            throw new Error(finalErrorMsg);
                         }
-                        // If nonce re-fetch failed or it's the last transaction attempt, fall through to general error handling / failure
-                    } else if (errorMessage.includes('txpool is full') || errorMessage.includes('exceeds block gas limit') || errorMessage.includes('insufficient funds') || errorMessage.includes('fee too low') || errorMessage.includes('transaction underpriced')) {
-                        // Specific retryable errors
-                        console.log(`Retryable error for Wallet ${walletInfo.address.substring(0,10)}: ${err.message}. Waiting ${RETRY_DELAY_MS}ms...`);
                         await delay(RETRY_DELAY_MS);
-                        if (attempt < MAX_TRANSACTION_RETRIES - 1) continue;
                     }
-                    // For other errors or if it's the last attempt
-                    if (attempt >= MAX_TRANSACTION_RETRIES - 1) {
-                        const finalErrorMsg = `Tx #${transactionNumber} (Wallet ${walletInfo.address.substring(0,10)}...): All retries failed. Last error: ${err.message}`;
-                        console.error(finalErrorMsg);
-                        // failedTransactions++; // Moved to the handler of taskPromise
-                        throw new Error(finalErrorMsg); // Propagate error to mark task as failed
-                    }
-                    // General delay for other errors before retrying
-                    await delay(RETRY_DELAY_MS);
+                } // End of retry loop
+                const allRetriesFailedError = `Tx #${transactionNumber} (Wallet ${walletInfo.address.substring(0,10)}...): Max retries reached, transaction ultimately failed.`;
+                console.error(allRetriesFailedError);
+                throw new Error(allRetriesFailedError);
+            })
+            .then(result => {
+                if (result && result.success) { // Check if result is defined
+                    successfulTransactions++;
                 }
-            } // End of retry loop
-            // If loop finishes, it means all retries failed without returning/throwing explicitly inside
-            const allRetriesFailedError = `Tx #${transactionNumber} (Wallet ${walletInfo.address.substring(0,10)}...): Max retries reached, transaction ultimately failed.`;
-            console.error(allRetriesFailedError);
-            throw new Error(allRetriesFailedError);
-        })
-        .then(result => {
-            if (result.success) {
-                successfulTransactions++;
+                // console.log(`Tx #${result.transactionNumber} completed for wallet ${result.walletAddress.substring(0,10)}`);
+            })
+            .catch(err => {
+                // console.error(`Tx processing for wallet (originally Tx #${transactionNumber}) ultimately failed: ${err.message}`);
+                failedTransactions++; 
+            })
+            .finally(() => {
+                const index = runningTasks.indexOf(taskPromise);
+                if (index > -1) {
+                    runningTasks.splice(index, 1);
+                }
+            });
+            runningTasks.push(taskPromise);
+            overallDispatchedCount++;
+
+            // Intermediate progress logging
+            if ((overallDispatchedCount % 100 === 0 || overallDispatchedCount === TOTAL_TRANSACTIONS_TO_SEND) && overallDispatchedCount > 0) {
+                const intermediateTime = Date.now();
+                console.log(`--- Dispatched ${overallDispatchedCount}/${TOTAL_TRANSACTIONS_TO_SEND} transaction flows. Elapsed: ${((intermediateTime - startTime) / 1000).toFixed(2)}s. Success: ${successfulTransactions}, Fail: ${failedTransactions} ---`);
             }
-            // console.log(`Tx #${result.transactionNumber} completed successfully for wallet ${result.walletAddress.substring(0,10)}`);
-        })
-        .catch(err => {
-            // Errors from withWalletLock's operation (e.g., all retries failed) will land here.
-            // console.error(`Tx processing for wallet ${walletInfo.address.substring(0,10)} (originally Tx #${transactionNumber}) ultimately failed: ${err.message}`);
-            failedTransactions++; 
-        })
-        .finally(() => {
-            const index = runningTasks.indexOf(taskPromise);
-            if (index > -1) {
-                runningTasks.splice(index, 1);
-            }
-            // if (runningTasks.length < MAX_CONCURRENT_TASKS) {
-            //     // console.log(`Concurrency slot freed. Active tasks: ${runningTasks.length}`);
-            // }
-        });
-        runningTasks.push(taskPromise);
+        }
+        if (overallDispatchedCount >= TOTAL_TRANSACTIONS_TO_SEND) break; // Break outer loop if all sent
+    }
 
         if ((i + 1) % 100 === 0 && i < TOTAL_TRANSACTIONS_TO_SEND -1) {
             const intermediateTime = Date.now();
