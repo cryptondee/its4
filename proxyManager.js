@@ -1,9 +1,9 @@
 // proxyManager.js
-import { ethers, Wallet, Contract } from 'ethers';
+import { ethers, Wallet, Contract, FetchRequest, FetchResponse } from 'ethers';
 import { HttpsProxyAgent } from 'https-proxy-agent';
 import fetch from 'node-fetch'; // For Node.js environment
 
-const MIN_REQUEST_INTERVAL_MS = 34; // Minimum 34ms between requests per proxy (~29.4 TPS)
+const MIN_REQUEST_INTERVAL_MS = 100; // Minimum 34ms between requests per proxy (~29.4 TPS) 
 const MAX_PROXY_FAILURES = 3;
 
 class ProxyManager {
@@ -16,6 +16,7 @@ class ProxyManager {
             id: `Proxy${index + 1}`,
             config: config,
             url: config.url, // Ensuring this matches the structure from mint.js
+            agent: new HttpsProxyAgent(config.url), // Create and store agent here
             requestQueue: [], // Standardized to requestQueue
             isProcessing: false,
             failureCount: 0,
@@ -27,7 +28,7 @@ class ProxyManager {
     }
 
     log(message) {
-        console.log(message); 
+        console.log(`[${new Date().toISOString()}] ${message}`); 
     }
 
     _getProviderForProxy(proxyInstance) {
@@ -81,171 +82,152 @@ class ProxyManager {
             this.log(`Proxy ${proxy.id}: Delaying next request by ${delayRequired}ms to respect rate limit.`);
         }
 
+        const jitter = Math.random() * 10; // Add 0-10ms jitter
         setTimeout(async () => {
             proxy.lastRequestTime = Date.now();
             // _sendTransactionThroughProxy will handle setting isProcessing = false
             // and then call _processQueue again if needed in its finally block.
             await this._sendTransactionThroughProxy(proxy, task);
-        }, delayRequired);
+        }, delayRequired + jitter);
     }
 
-    async _sendTransactionThroughProxy(proxy, task) {
-        this.log(`Proxy ${proxy.id}: Processing task for wallet ${task.privateKey.substring(0,10)}... (Method/Data: ${task.methodName ? task.methodName.substring(0,40) : 'N/A'}...)`);
-        const agent = new HttpsProxyAgent(proxy.url);
+async _sendTransactionThroughProxy(proxy, task) {
+    this.log(`Proxy ${proxy.id}: Processing task for wallet ${task.privateKey.substring(0,10)}... (Method/Data: ${task.methodName ? task.methodName.substring(0,40) : 'N/A'}...)`);
+    const agent = proxy.agent; // Use agent from proxy object
 
-        const customFetch = async (request) => {
-            const anRequest = new FetchRequest(request.url);
-            anRequest.body = request.body;
-            anRequest.headers = request.headers;
-            anRequest.method = request.method;
-            const fetchResponse = await fetch(anRequest, { agent: agent });
-            return new FetchResponse(fetchResponse.status, fetchResponse.statusText, Object.fromEntries(fetchResponse.headers.entries()), fetchResponse.body, request);
+    // customFetch for ethers.JsonRpcProvider to use HttpsProxyAgent
+    // Assumes FetchRequest and FetchResponse will be imported from 'ethers'
+    const customFetch = async (request) => { // request is ethers.FetchRequest
+        const options = {
+            method: request.method,
+            headers: request.headersToObject(), // Converts ethers.Headers to a plain object for node-fetch
+            body: request.body, // request.body is Uint8Array | null
+            agent: agent // The HttpsProxyAgent instance
         };
 
-        const proxiedProvider = new ethers.JsonRpcProvider(this.rpcUrl, undefined, { batchMaxCount: 1, fetchFunc: customFetch });
-        const proxiedSigner = new ethers.Wallet(task.privateKey, proxiedProvider);
+        const nodeFetchResponse = await fetch(request.url, options); // node-fetch call
 
-        try {
-            let transactionRequest = {};
+        // Convert node-fetch Headers back to a plain object for ethers.FetchResponse
+        const responseHeaders = {};
+        nodeFetchResponse.headers.forEach((value, key) => { responseHeaders[key] = value; });
+        
+        const responseBody = await nodeFetchResponse.arrayBuffer(); // Get body as ArrayBuffer
 
-            if (task.methodName && typeof task.methodName === 'string' && task.methodName.startsWith('0x') && (!task.methodArgs || task.methodArgs.length === 0)) {
-                this.log(`Proxy ${proxy.id}: Wallet ${proxiedSigner.address} - Preparing raw transaction with data: ${task.methodName}`);
-                transactionRequest = {
-                    to: this.contractAddress,
-                    data: task.methodName,
-                    nonce: task.nonce, // Use nonce from task
-                    ...(task.txOptions || {}) // Includes value, gasLimit, etc.
-                };
-            } else if (this.contractAbi && this.contractAbi.length > 0 && task.methodName) {
-                this.log(`Proxy ${proxy.id}: Wallet ${proxiedSigner.address} - Populating transaction for method '${task.methodName}'`);
-                const contract = new ethers.Contract(this.contractAddress, this.contractAbi, proxiedSigner);
-                const populatedTx = await contract[task.methodName].populateTransaction(...(task.methodArgs || []), task.txOptions || {});
-                transactionRequest = populatedTx;
-                if (transactionRequest.nonce == null) transactionRequest.nonce = task.nonce; // Ensure nonce from task is used if not populated by ABI method
-            } else {
-                proxy.failureCount++;
-                if (proxy.failureCount >= MAX_PROXY_FAILURES) proxy.isHealthy = false;
-                const errorMessage = `Proxy ${proxy.id}: Wallet ${proxiedSigner.address} - Failed: Insufficient data. For ABI calls, methodName & ABI required. For raw calls, methodName (as data) required. Proxy healthy: ${proxy.isHealthy}`;
-                this.log(errorMessage);
-                task.reject(new Error(errorMessage));
-                // Ensure finally block runs, but no further processing in try block
-                return; 
-            }
+        return new FetchResponse(
+            nodeFetchResponse.status,
+            nodeFetchResponse.statusText,
+            responseHeaders,
+            new Uint8Array(responseBody), // ethers.FetchResponse expects Uint8Array
+            request // The original ethers.FetchRequest that initiated this
+        );
+    };
 
-            // Ensure 'to' is set if not already by ABI population
-            if (!transactionRequest.to && this.contractAddress) {
-                transactionRequest.to = this.contractAddress;
-            }
+    const proxiedProvider = new ethers.JsonRpcProvider(this.rpcUrl, undefined, { batchMaxCount: 1, fetchFunc: customFetch });
+    const proxiedSigner = new ethers.Wallet(task.privateKey, proxiedProvider);
 
-            let receipt = null;
+    let receipt = null;
 
+    try {
+        let transactionRequest = {};
+
+        if (task.methodName && typeof task.methodName === 'string' && task.methodName.startsWith('0x') && (!task.methodArgs || task.methodArgs.length === 0)) {
+            this.log(`Proxy ${proxy.id}: Wallet ${proxiedSigner.address} - Preparing raw transaction with data: ${task.methodName}`);
+
+            transactionRequest = {
+                to: this.contractAddress,
+                data: task.methodName,
+                nonce: task.nonce,
+                ...(task.txOptions || {})
+            };
+        } else if (this.contractAbi && this.contractAbi.length > 0 && task.methodName) {
+            this.log(`Proxy ${proxy.id}: Wallet ${proxiedSigner.address} - Populating transaction for method '${task.methodName}'`);
+            const contract = new ethers.Contract(this.contractAddress, this.contractAbi, proxiedSigner);
+            const rawTxObject = {
+                nonce: task.nonce,
+                gasLimit: task.txOptions.gasLimit,
+                gasPrice: task.txOptions.gasPrice,
+                data: task.methodName
+            };
+            this.log(`Proxy ${proxy.id}: Wallet ${proxiedSigner.address} - Raw tx object PRE-POPULATE. Nonce: ${rawTxObject.nonce}, GasLimit: ${rawTxObject.gasLimit}, GasPrice: ${rawTxObject.gasPrice}, Data: ${rawTxObject.data ? rawTxObject.data.substring(0,10) : 'N/A'}...`);
+            const populatedTx = await contract[task.methodName].populateTransaction(...(task.methodArgs || []), task.txOptions || {});
+            transactionRequest = populatedTx;
+            if (transactionRequest.nonce == null) transactionRequest.nonce = task.nonce;
+        } else {
+            const errorMessage = `Proxy ${proxy.id}: Wallet ${proxiedSigner.address} - Failed: Insufficient data for transaction. MethodName: ${task.methodName}`;
+            this.log(errorMessage);
+            throw new Error(errorMessage);
+        }
+
+        if (!transactionRequest.to && this.contractAddress) {
+            transactionRequest.to = this.contractAddress;
+        }
+
+        // this.log(`Proxy ${proxy.id}: Wallet ${proxiedSigner.address} - Using standard sendTransaction. TxRequest: To: ${transactionRequest.to}, Nonce: ${transactionRequest.nonce}, Data: ${transactionRequest.data ? transactionRequest.data.substring(0,40) : 'N/A'}...`);
+        const txResponse = await proxiedSigner.sendTransaction(transactionRequest);
+        this.log(`Proxy ${proxy.id}: Wallet ${proxiedSigner.address} - Standard transaction sent, hash: ${txResponse.hash}. Waiting for ${this.confirmations} confirmation(s)...`);
+
+        if (this.confirmations > 0) {
             try {
-                this.log(`Proxy ${proxy.id}: Wallet ${proxiedSigner.address} - Preparing for realtime_sendRawTransaction.`);
-                const txForSigning = { ...transactionRequest }; // Clone to avoid mutating original request used in fallback
-
-                // Nonce is now sourced from task.nonce, set in transactionRequest and cloned to txForSigning
-            // if (txForSigning.nonce == null) txForSigning.nonce = await proxiedSigner.getNonce(); // Removed
-                if (txForSigning.chainId == null) {
-                    const network = await proxiedProvider.getNetwork();
-                    txForSigning.chainId = network.chainId;
-                }
-
-                if (txForSigning.gasPrice == null && txForSigning.maxFeePerGas == null) {
-                    const feeData = await proxiedProvider.getFeeData();
-                    if (feeData.maxFeePerGas != null && feeData.maxPriorityFeePerGas != null) {
-                        txForSigning.maxFeePerGas = feeData.maxFeePerGas;
-                        txForSigning.maxPriorityFeePerGas = feeData.maxPriorityFeePerGas;
-                    } else if (feeData.gasPrice != null) {
-                        txForSigning.gasPrice = feeData.gasPrice;
-                    } else {
-                        this.log(`Proxy ${proxy.id}: Wallet ${proxiedSigner.address} - Fee data unavailable. Will use standard send.`);
-                        throw new Error("Fee data unavailable for realtime send attempt."); // Triggers catch for this block, leading to fallback
+                receipt = await txResponse.wait(this.confirmations);
+                if (receipt) {
+                    receipt.proxyId = proxy.id;
+                    receipt.method = 'standard_sendTransaction_with_wait';
+                    if (typeof receipt.status === 'undefined') {
+                        this.log(`Proxy ${proxy.id}: Wallet ${proxiedSigner.address} - txResponse.wait() receipt missing status, assuming 1 (success).`);
+                        receipt.status = 1;
                     }
-                }
-
-                if (txForSigning.gasLimit == null) {
-                    // Ensure all fields needed by estimateGas are present (especially 'from' which is implicit in signer)
-                    txForSigning.gasLimit = await proxiedSigner.estimateGas(txForSigning);
-                }
-                
-                const signedTxHex = await proxiedSigner.signTransaction(txForSigning);
-                this.log(`Proxy ${proxy.id}: Wallet ${proxiedSigner.address} - Attempting realtime_sendRawTransaction with signed tx: ${signedTxHex.substring(0,60)}...`);
-                
-                receipt = await proxiedProvider.send('realtime_sendRawTransaction', [signedTxHex]);
-                
-                if (receipt && receipt.transactionHash) {
-                    this.log(`Proxy ${proxy.id}: Wallet ${proxiedSigner.address} - realtime_sendRawTransaction successful. Hash: ${receipt.transactionHash}`);
                 } else {
-                    this.log(`Proxy ${proxy.id}: Wallet ${proxiedSigner.address} - realtime_sendRawTransaction did not return a valid receipt (Receipt: ${JSON.stringify(receipt)}), falling back.`);
-                    receipt = null; // Force fallback
+                    this.log(`Proxy ${proxy.id}: Wallet ${proxiedSigner.address} - txResponse.wait() returned null. Considering successful based on hash.`);
+                    receipt = { transactionHash: txResponse.hash, status: 1, confirmations: this.confirmations, proxyId: proxy.id, method: 'standard_sendTransaction_wait_returned_null' };
                 }
-            } catch (realtimeError) {
-                this.log(`Proxy ${proxy.id}: Wallet ${proxiedSigner.address} - realtime_sendRawTransaction attempt failed: ${realtimeError.message}. Falling back to standard send.`);
-                receipt = null; // Ensure fallback path is taken
-            }
-
-            if (!receipt) { // Fallback to standard sendTransaction
-                this.log(`Proxy ${proxy.id}: Wallet ${proxiedSigner.address} - Using standard sendTransaction. Original txRequest: To: ${transactionRequest.to}, Data: ${transactionRequest.data ? transactionRequest.data.substring(0,40) : 'N/A'}...`);
-                // transactionRequest already contains the nonce from task.nonce.
-                // ethers.js will use this nonce.
-                const txResponse = await proxiedSigner.sendTransaction(transactionRequest);
-                this.log(`Proxy ${proxy.id}: Wallet ${proxiedSigner.address} - Standard transaction sent, hash: ${txResponse.hash}. Waiting for ${this.confirmations} confirmation(s)...`);
-                if (this.confirmations > 0) {
-                    try {
-                        receipt = await txResponse.wait(this.confirmations);
-                        if (receipt) {
-                           receipt.proxyId = proxy.id;
-                           receipt.method = 'standard_sendTransaction_with_wait';
-                           // Ensure status is present, ethers.js wait() receipt should have it
-                           if (typeof receipt.status === 'undefined') {
-                               this.log(`Proxy ${proxy.id}: Wallet ${proxiedSigner.address} - txResponse.wait() receipt missing status, assuming 1 (success).`);
-                               receipt.status = 1; 
-                           }
-                        } else { 
-                            this.log(`Proxy ${proxy.id}: Wallet ${proxiedSigner.address} - txResponse.wait() returned null. Proceeding with hash only.`);
-                            receipt = { transactionHash: txResponse.hash, status: 1, confirmations: this.confirmations, proxyId: proxy.id, method: 'standard_sendTransaction_wait_returned_null' };
-                        }
-                    } catch (waitError) {
-                        const waitErrorMessage = waitError.message ? waitError.message.toLowerCase() : '';
-                        if (waitErrorMessage.includes("full block not allowed")) {
-                            this.log(`Proxy ${proxy.id}: Wallet ${proxiedSigner.address} - txResponse.wait() failed with "full block not allowed". Proceeding with hash only. Error: ${waitError.message}`);
-                            receipt = { transactionHash: txResponse.hash, status: 1, confirmations: 0, proxyId: proxy.id, method: 'standard_sendTransaction_full_block_fallback' };
-                        } else {
-                            this.log(`Proxy ${proxy.id}: Wallet ${proxiedSigner.address} - txResponse.wait() failed with unexpected error: ${waitError.message}`);
-                            throw waitError; 
-                        }
-                    }
-                } else { 
-                    receipt = { transactionHash: txResponse.hash, status: 1, confirmations: 0, proxyId: proxy.id, method: 'standard_sendTransaction_no_wait' };
+            } catch (waitError) {
+                const waitErrorMessage = waitError.message ? waitError.message.toLowerCase() : '';
+                if (waitErrorMessage.includes("full block not allowed")) {
+                    this.log(`Proxy ${proxy.id}: Wallet ${proxiedSigner.address} - txResponse.wait() failed with "full block not allowed". Proceeding with hash only. Error: ${waitError.message}`);
+                    receipt = { transactionHash: txResponse.hash, status: 1, confirmations: 0, proxyId: proxy.id, method: 'standard_sendTransaction_full_block_fallback' };
+                } else {
+                    this.log(`Proxy ${proxy.id}: Wallet ${proxiedSigner.address} - txResponse.wait() failed with unexpected error: ${waitError.message}`);
+                    throw waitError;
                 }
-                this.log(`Proxy ${proxy.id}: Wallet ${proxiedSigner.address} - Standard transaction processing completed. Hash: ${(receipt ? receipt.transactionHash : txResponse.hash)}, Status: ${(receipt ? receipt.status : 'unknown')}, Method: ${(receipt ? receipt.method : 'unknown')}`);
             }
+        } else { // No confirmations requested
+            receipt = { transactionHash: txResponse.hash, status: 1, confirmations: 0, proxyId: proxy.id, method: 'standard_sendTransaction_no_wait' };
+        }
+        
+        this.log(`Proxy ${proxy.id}: Wallet ${proxiedSigner.address} - Standard transaction processing completed. Hash: ${(receipt ? receipt.transactionHash : txResponse.hash)}, Status: ${(receipt ? receipt.status : 'unknown')}`);
+        proxy.failureCount = 0; // Reset failure count on success
+        proxy.isHealthy = true;   // Ensure proxy is marked healthy on success
+        task.resolve(receipt);
 
-            proxy.failureCount = 0; 
-            proxy.isHealthy = true; 
-            task.resolve(receipt); // Resolve with the final receipt
-
-        } catch (error) {
+    } catch (error) {
+        if (error.code === 'NETWORK_ERROR') {
+            this.log(`Proxy ${proxy.id}: Wallet ${proxiedSigner.address} - Network error during transaction: ${error.message}`);
+        } else if (error.code === 'INSUFFICIENT_FUNDS') {
+            this.log(`Proxy ${proxy.id}: Wallet ${proxiedSigner.address} - Insufficient funds for transaction: ${error.message}`);
+        } else {
             this.log(`Proxy ${proxy.id}: Wallet ${proxiedSigner.address} - Overall error in _sendTransactionThroughProxy: ${error.message} (Stack: ${error.stack})`);
-            proxy.failureCount++;
-            if (proxy.failureCount >= MAX_PROXY_FAILURES) {
-                proxy.isHealthy = false;
-                this.log(`Proxy ${proxy.id}: Marked as unhealthy due to ${proxy.failureCount} failures.`);
-            }
-            task.reject(error); 
-        } finally {
-            proxy.isProcessing = false;
-            this.log(`Proxy ${proxy.id}: Task finished processing. Healthy: ${proxy.isHealthy}, Queue length: ${proxy.requestQueue.length}`);
-            if (proxy.isHealthy && proxy.requestQueue.length > 0) {
-                this.log(`Proxy ${proxy.id}: Attempting to process next in its queue.`);
-                this._processQueue(proxy); // Pass the full proxy object
-            } else if (!proxy.isHealthy) {
-                this.log(`Proxy ${proxy.id}: Not processing further from its queue (unhealthy).`);
-            }
+        }
+        proxy.failureCount++;
+        if (proxy.failureCount >= MAX_PROXY_FAILURES) {
+            proxy.isHealthy = false;
+            this.log(`Proxy ${proxy.id}: Marked as unhealthy due to ${proxy.failureCount} failures.`);
+        }
+        task.reject(error);
+    } finally {
+        proxy.isProcessing = false;
+        this.log(`Proxy ${proxy.id}: Task finished processing. Healthy: ${proxy.isHealthy}, Queue length: ${proxy.requestQueue.length}`);
+        if (proxy.isHealthy && proxy.requestQueue.length > 0) {
+            this.log(`Proxy ${proxy.id}: Attempting to process next in its queue.`);
+            this._processQueue(proxy);
+        } else if (!proxy.isHealthy) {
+            this.log(`Proxy ${proxy.id}: Not processing further from its queue (unhealthy).`);
         }
     }
+}
 
-    submitTransaction(privateKey, nonce, methodName, methodArgs = [], txOptions = {}) {
+    submitTransaction(privateKey, nonce, methodName, methodArgs, txOptions) {
+        methodArgs = methodArgs || [];
+        txOptions = txOptions || {};
         return new Promise((resolve, reject) => {
             const selectedProxy = this._selectProxy();
             if (!selectedProxy) {
@@ -253,7 +235,9 @@ class ProxyManager {
                 return;
             }
 
-            selectedProxy.requestQueue.push({ privateKey, methodName, methodArgs, txOptions, resolve, reject });
+            const taskData = { privateKey, methodName, methodArgs, txOptions, resolve, reject, nonce };
+    
+            selectedProxy.requestQueue.push(taskData);
             console.log(`[${selectedProxy.id}] Task queued for wallet ${privateKey.substring(0,10)}... Method: ${methodName}. Queue size: ${selectedProxy.requestQueue.length}`);
 
             if (!selectedProxy.isProcessing) {

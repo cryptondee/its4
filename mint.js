@@ -1,28 +1,70 @@
 // mint.js
-
+import 'dotenv/config'; // Make sure to install dotenv: npm install dotenv
+import ProxyManager from './proxyManager.js';
+import { ethers } from 'ethers'; // Used for AbiCoder and Wallet // Only needed here for Wallet address display or utils
 const MAX_TRANSACTION_RETRIES = 5;
 const RETRY_DELAY_MS = 1000; // 1 second delay for general retries
 const NONCE_RETRY_DELAY_MS = 500; // Shorter delay if only re-fetching nonce
 const DIRECT_PROVIDER_CALL_INTERVAL_MS = 100; // Min interval between direct provider calls for nonce
 
+// Helper function to generate multicall data for an aggregate(Call[] calls) style multicall
+function generateMulticallData(targetAddress, individualMintCalldata, count) {
+  const calls = [];
+  for (let i = 0; i < count; i++) {
+    calls.push({
+      target: targetAddress, // The contract to call for each mint
+      callData: individualMintCalldata // The calldata for the individual mint function
+    });
+  }
+
+  // Define the structure of the Call type
+  const callStructType = "tuple(address target, bytes callData)[]";
+  
+  // The ethers.js AbiCoder will correctly encode the array of Call structs
+  const abiCoder = ethers.AbiCoder.defaultAbiCoder();
+  const encodedCallsArray = abiCoder.encode([callStructType], [calls]);
+
+  const multicallFunctionSelector = '0x252dba42'; // Selector for aggregate(Call[] calldata calls)
+
+  // The final calldata is the selector + encoded arguments
+  return multicallFunctionSelector + encodedCallsArray.substring(2); // Remove '0x' from encodedCallsArray
+}
+
 async function delay(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
-import 'dotenv/config'; // Make sure to install dotenv: npm install dotenv
-import ProxyManager from './proxyManager.js';
-import { ethers } from 'ethers'; // Only needed here for Wallet address display or utils
+
 
 // --- Configuration ---
 // IMPORTANT: Replace with your actual data or load from .env
 const RPC_URL = process.env.RPC_URL || 'YOUR_FALLBACK_RPC_URL_HERE';
-const CONTRACT_ADDRESS = process.env.CONTRACT_ADDRESS || 'YOUR_CONTRACT_ADDRESS_HERE';
+const CONTRACT_ADDRESS = process.env.CONTRACT_ADDRESS || '0xb1f60733c7b76f8f4085af3d9f6e374c43e462f8'; // The multicall contract address
+const TOKEN_CONTRACT_ADDRESS = process.env.TOKEN_CONTRACT_ADDRESS || '0xbe43d66327ca5b77e7f14870a94a3058511103d3'; // The actual token contract to call mint on (assumed same as multicall)
+console.log(`[DEBUG] Using CONTRACT_ADDRESS: ${CONTRACT_ADDRESS}`);
+console.log(`[DEBUG] Using TOKEN_CONTRACT_ADDRESS: ${TOKEN_CONTRACT_ADDRESS}`);
+const CONFIRMATIONS_REQUIRED = parseInt(process.env.CONFIRMATIONS_REQUIRED) || 0;
 
 // Contract ABI is not strictly needed for sending raw transaction data directly,
 // but ProxyManager constructor expects it (can be an empty array).
 const CONTRACT_ABI = []; 
 
-const RAW_TRANSACTION_DATA = process.env.RAW_TRANSACTION_DATA_OVERRIDE || '0x05632f40'; // User-provided raw transaction data
-const TOTAL_TRANSACTIONS_TO_SEND = 100; // <<< SET TOTAL NUMBER OF TRANSACTIONS TO SEND HERE
+// --- Multicall Configuration ---
+// The ABI for TOKEN_CONTRACT_ADDRESS (0xbe43d66327ca5b77e7f14870a94a3058511103d3)
+// indicates a parameterless mint function with selector 0x05632f40.
+// This function will mint tokens to the msg.sender of the call.
+// In the multicall context, msg.sender for the mint() call is the multicall contract (CONTRACT_ADDRESS).
+const MINT_FUNCTION_SELECTOR = '0x05632f40'; // Selector for the parameterless mint() function
+const SINGLE_MINT_CALLDATA = MINT_FUNCTION_SELECTOR;
+
+// RECIPIENT_ADDRESS is the address expected to receive the tokens.
+// With the parameterless mint, this will be the multicall contract itself.
+const RECIPIENT_ADDRESS = '0xb1f60733c7b76f8f4085af3d9f6e374c43e462f8';
+const MINTS_PER_MULTICALL = 125; // Number of mints to batch in one multicall transaction
+const RAW_TRANSACTION_DATA = generateMulticallData(TOKEN_CONTRACT_ADDRESS, SINGLE_MINT_CALLDATA, MINTS_PER_MULTICALL);
+
+// --- Script Execution Configuration ---
+const TOTAL_TRANSACTIONS_TO_SEND = 10000; // Number of multicall transactions to send
+const MAX_CONCURRENT_TASKS_CONFIG = 150; // Max concurrent tasks for ProxyManager
 
 // --- Oxylabs Proxy Configuration ---
 const OXYLABS_CORE_USERNAME = process.env.OXYLABS_CORE_USERNAME;
@@ -35,7 +77,7 @@ if (!OXYLABS_CORE_USERNAME || !OXYLABS_PASSWORD) {
     process.exit(1);
 }
 
-const NUM_PROXY_SESSIONS = 80; // The number of concurrent proxy sessions you want
+const NUM_PROXY_SESSIONS = 120; // The number of concurrent proxy sessions you want
 const PROXY_CONFIGS = [];
 
 for (let i = 0; i < NUM_PROXY_SESSIONS; i++) {
@@ -168,6 +210,35 @@ if (walletInfos.length === 0) {
     process.exit(1);
 }
 
+const walletLocks = new Map(); // walletAddress -> Promise (representing the lock)
+
+async function withWalletLock(walletAddress, operation) {
+    // Wait for the previous operation on this wallet to complete
+    // Check if a lock exists and wait for it
+    while (walletLocks.has(walletAddress)) {
+        try {
+            await walletLocks.get(walletAddress);
+        } catch (e) {
+            // If the existing lock promise rejects, that's fine, the lock is still 'released'
+            // console.warn(`Wallet ${walletAddress.substring(0,10)}: Warning - awaited lock promise rejected. This is usually okay.`);
+        }
+    }
+
+    // Acquire lock: Create a new promise and store it
+    let releaseLock;
+    const lockPromise = new Promise(resolve => { releaseLock = resolve; });
+    walletLocks.set(walletAddress, lockPromise);
+
+    try {
+        return await operation();
+    } finally {
+        // Release lock: remove the promise from the map and resolve it
+        // This allows the next waiter (if any) to proceed past the await walletLocks.get(walletAddress)
+        walletLocks.delete(walletAddress);
+        releaseLock(); 
+    }
+}
+
 async function main() {
     const startTime = Date.now();
     console.log('Starting transaction minting process with explicit nonce management...');
@@ -177,7 +248,7 @@ async function main() {
     }
 
     // Initialize ProxyManager
-    const proxyManager = new ProxyManager(PROXY_CONFIGS, RPC_URL, CONTRACT_ADDRESS, CONTRACT_ABI, 1 /* confirmations */);
+    const proxyManager = new ProxyManager(PROXY_CONFIGS, RPC_URL, CONTRACT_ADDRESS, CONTRACT_ABI, CONFIRMATIONS_REQUIRED);
 
     // Step 1: Fetch initial nonces for all wallets
     console.log("Fetching initial nonces for all wallets...");
@@ -200,27 +271,42 @@ async function main() {
 
     console.log(`Starting a total of ${TOTAL_TRANSACTIONS_TO_SEND} transactions using ${activeWallets.length} active wallets. Raw data: ${RAW_TRANSACTION_DATA}`);
 
-    const transactionPromises = [];
+    const MAX_CONCURRENT_TASKS = 50; // Max number of concurrent transaction processing flows
+    const runningTasks = []; // Stores promises of currently running transaction flows
     let successfulTransactions = 0;
     let failedTransactions = 0;
+    let globalTransactionCounter = 0; // To ensure unique transaction numbers even with retries
+
+    console.log(`Starting transaction loop with MAX_CONCURRENT_TASKS: ${MAX_CONCURRENT_TASKS}`);
 
     for (let i = 0; i < TOTAL_TRANSACTIONS_TO_SEND; i++) {
+        if (runningTasks.length >= MAX_CONCURRENT_TASKS) {
+            // console.log(`Concurrency limit ${MAX_CONCURRENT_TASKS} reached. Waiting for a task to complete... (${runningTasks.length} active)`);
+            try {
+                await Promise.race(runningTasks);
+            } catch (e) {
+                // A promise in Promise.race might have rejected, this is fine, it means a slot is free.
+                // console.log("A task completed (possibly with error), freeing up concurrency slot.");
+            }
+        }
+
         const walletIndex = i % activeWallets.length;
         const walletInfo = activeWallets[walletIndex];
-        const transactionNumber = i + 1; // For logging, 1-based index
+        const transactionNumber = ++globalTransactionCounter; // Use a global counter for unique tx logging ID
 
-        await delay(25); // Add 25ms delay before processing each transaction
-
-        const promise = (async () => {
+        const taskPromise = withWalletLock(walletInfo.address, async () => {
+            // This async block is serialized per wallet due to withWalletLock
+            // It represents the processing for a single transaction for this wallet
             for (let attempt = 0; attempt < MAX_TRANSACTION_RETRIES; attempt++) {
                 try {
                     console.log(`Tx #${transactionNumber} (Wallet ${walletInfo.address.substring(0,10)}..., Nonce ${walletInfo.currentNonce}, Attempt ${attempt + 1}/${MAX_TRANSACTION_RETRIES}): Preparing...`);
                     
                     const rawData = RAW_TRANSACTION_DATA;
                     const methodArgs = [];
+                    console.log(`Tx #${transactionNumber}: Using RAW_TRANSACTION_DATA starting with: ${rawData.substring(0, 70)}`);
                     const txOptions = {
-                        gasLimit: 90000,
-                        gasPrice: ethers.parseUnits("0.0012", "gwei"),
+                        gasLimit: 5000000,
+                        gasPrice: ethers.parseUnits("0.0019", "gwei"),
                     };
 
                     const txResult = await proxyManager.submitTransaction(walletInfo.privateKey, walletInfo.currentNonce, rawData, methodArgs, txOptions);
@@ -228,7 +314,8 @@ async function main() {
                     console.log(`Tx #${transactionNumber} (Wallet ${walletInfo.address.substring(0,10)}..., Nonce ${walletInfo.currentNonce}): Successfully sent. Result: ${txResult ? JSON.stringify(txResult).substring(0,80) : 'No result'}`);
                     walletInfo.currentNonce++; // IMPORTANT: Increment nonce for this wallet
                     successfulTransactions++;
-                    return { status: 'fulfilled', value: txResult, walletAddress: walletInfo.address };
+                    // successfulTransactions++; // Moved to the handler of taskPromise
+                    return { success: true, result: txResult, walletAddress: walletInfo.address, transactionNumber };
                 } catch (err) {
                     console.error(`Tx #${transactionNumber} (Wallet ${walletInfo.address.substring(0,10)}..., Nonce ${walletInfo.currentNonce}, Attempt ${attempt + 1}): Failed: ${err.message}`);
                     
@@ -263,7 +350,7 @@ async function main() {
                             continue; // Retry transaction submission with the new nonce
                         }
                         // If nonce re-fetch failed or it's the last transaction attempt, fall through to general error handling / failure
-                    } else if (errorMessage.includes('txpool is full') || errorMessage.includes('exceeds block gas limit') || errorMessage.includes('insufficient funds')) {
+                    } else if (errorMessage.includes('txpool is full') || errorMessage.includes('exceeds block gas limit') || errorMessage.includes('insufficient funds') || errorMessage.includes('fee too low') || errorMessage.includes('transaction underpriced')) {
                         // Specific retryable errors
                         console.log(`Retryable error for Wallet ${walletInfo.address.substring(0,10)}: ${err.message}. Waiting ${RETRY_DELAY_MS}ms...`);
                         await delay(RETRY_DELAY_MS);
@@ -271,18 +358,41 @@ async function main() {
                     }
                     // For other errors or if it's the last attempt
                     if (attempt >= MAX_TRANSACTION_RETRIES - 1) {
-                        console.error(`Tx #${transactionNumber} (Wallet ${walletInfo.address.substring(0,10)}...): All retries failed or non-retryable error. Error: ${err.message}`);
-                        failedTransactions++;
-                        return { status: 'rejected', reason: err.message, walletAddress: walletInfo.address };
+                        const finalErrorMsg = `Tx #${transactionNumber} (Wallet ${walletInfo.address.substring(0,10)}...): All retries failed. Last error: ${err.message}`;
+                        console.error(finalErrorMsg);
+                        // failedTransactions++; // Moved to the handler of taskPromise
+                        throw new Error(finalErrorMsg); // Propagate error to mark task as failed
                     }
                     // General delay for other errors before retrying
                     await delay(RETRY_DELAY_MS);
                 }
             } // End of retry loop
-            // Should not be reached if logic inside loop is correct (either returns or throws)
-            return { status: 'rejected', reason: 'Retry loop exited unexpectedly', walletAddress: walletInfo.address }; 
-        })();
-        transactionPromises.push(promise);
+            // If loop finishes, it means all retries failed without returning/throwing explicitly inside
+            const allRetriesFailedError = `Tx #${transactionNumber} (Wallet ${walletInfo.address.substring(0,10)}...): Max retries reached, transaction ultimately failed.`;
+            console.error(allRetriesFailedError);
+            throw new Error(allRetriesFailedError);
+        })
+        .then(result => {
+            if (result.success) {
+                successfulTransactions++;
+            }
+            // console.log(`Tx #${result.transactionNumber} completed successfully for wallet ${result.walletAddress.substring(0,10)}`);
+        })
+        .catch(err => {
+            // Errors from withWalletLock's operation (e.g., all retries failed) will land here.
+            // console.error(`Tx processing for wallet ${walletInfo.address.substring(0,10)} (originally Tx #${transactionNumber}) ultimately failed: ${err.message}`);
+            failedTransactions++; 
+        })
+        .finally(() => {
+            const index = runningTasks.indexOf(taskPromise);
+            if (index > -1) {
+                runningTasks.splice(index, 1);
+            }
+            // if (runningTasks.length < MAX_CONCURRENT_TASKS) {
+            //     // console.log(`Concurrency slot freed. Active tasks: ${runningTasks.length}`);
+            // }
+        });
+        runningTasks.push(taskPromise);
 
         if ((i + 1) % 100 === 0 && i < TOTAL_TRANSACTIONS_TO_SEND -1) {
             const intermediateTime = Date.now();
@@ -290,8 +400,9 @@ async function main() {
         }
     }
 
-    // Wait for all transaction processing flows (including retries) to settle.
-    await Promise.allSettled(transactionPromises);
+    // Wait for all remaining tasks to complete
+    console.log(`All ${TOTAL_TRANSACTIONS_TO_SEND} transaction flows dispatched. Waiting for ${runningTasks.length} active tasks to complete...`);
+    await Promise.allSettled(runningTasks);
     const endTime = Date.now();
     const totalTimeSeconds = ((endTime - startTime) / 1000).toFixed(2);
 
